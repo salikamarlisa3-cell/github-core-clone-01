@@ -1,49 +1,130 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
-//
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+// The forge's HTTP wiring: one node:http server that routes /healthz, the REST v3 surface
+// (/api/v3), GraphQL (/api/graphql), MCP (/mcp) and git smart HTTP (/{owner}/{repo}.git).
+// Every surface but /healthz requires the shop token as a Bearer credential; the store behind
+// them all is the singleton in store.ts. main.ts owns the lifecycle and stays as it shipped.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { handleGit } from './githttp.ts';
+import { handleGraphql } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
+import { handleRest } from './rest.ts';
+import type { Ctx, Reply } from './http.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
-
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+function readBody(request: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    request.on('data', (chunk: Buffer) => chunks.push(chunk));
+    request.on('end', () => resolve(Buffer.concat(chunks)));
+    request.on('error', reject);
+  });
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
+function writeReply(response: ServerResponse, reply: Reply, isApi: boolean, requestId: string): void {
+  const headers: Record<string, string> = { ...(reply.headers ?? {}) };
+  let body: Buffer;
+  if (reply.raw !== undefined) {
+    body = reply.raw;
+    headers['content-type'] = reply.contentType ?? 'application/octet-stream';
+  } else if (reply.body !== undefined) {
+    body = Buffer.from(JSON.stringify(reply.body), 'utf8');
+    headers['content-type'] = reply.contentType ?? 'application/json; charset=utf-8';
+  } else {
+    body = Buffer.alloc(0);
+    if (reply.contentType !== undefined) headers['content-type'] = reply.contentType;
+    else if (isApi) headers['content-type'] = 'application/json; charset=utf-8';
   }
+  if (isApi) headers['x-github-request-id'] = requestId;
+  headers['content-length'] = String(body.length);
+  response.writeHead(reply.status, headers);
+  response.end(body);
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
+/** Build the server. It binds nothing until the caller listens. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
+  let requestCounter = 0;
 
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
+  function authorized(request: IncomingMessage): boolean {
+    const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+    if (expected === '') return false;
+    return request.headers.authorization === `Bearer ${expected}`;
+  }
+
+  function route(request: IncomingMessage, ctx: Ctx): Reply {
+    const { segments } = ctx;
+    if (ctx.method === 'GET' && segments.length === 1 && segments[0] === 'healthz') {
+      return { status: 200, body: { ok: true } };
     }
-
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
+    if (!authorized(request)) {
+      return { status: 401, body: { message: 'Bad credentials' } };
     }
+    if (segments[0] === 'api' && segments[1] === 'v3') return handleRest(ctx);
+    if (segments[0] === 'api' && segments[1] === 'graphql' && segments.length === 2 && ctx.method === 'POST') return handleGraphql(ctx);
+    if (segments[0] === 'mcp' && segments.length === 1 && ctx.method === 'POST') return handleMcp(ctx);
+    if (segments.length >= 2 && (segments[1] as string).endsWith('.git')) {
+      const gitProtocol = request.headers['git-protocol'];
+      return handleGit(
+        ctx,
+        segments[0] as string,
+        (segments[1] as string).slice(0, -'.git'.length),
+        segments.slice(2),
+        typeof gitProtocol === 'string' ? gitProtocol : null,
+      );
+    }
+    return { status: 404, body: { message: 'Not Found' } };
+  }
 
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
+  async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    requestCounter += 1;
+    const requestId = `req-${requestCounter.toString(36)}`;
+    const rawBody = await readBody(request);
+    const url = new URL(request.url ?? '/', 'http://localhost');
+    const segments = url.pathname
+      .split('/')
+      .filter((segment) => segment !== '')
+      .map((segment) => {
+        try {
+          return decodeURIComponent(segment);
+        } catch {
+          return segment;
+        }
+      });
+    const isApi = segments[0] === 'api';
+    let json: unknown;
+    let jsonError = false;
+    if (rawBody.length > 0) {
+      try {
+        json = JSON.parse(rawBody.toString('utf8'));
+      } catch {
+        jsonError = true;
+      }
+    }
+    const ctx: Ctx = {
+      method: request.method ?? 'GET',
+      path: url.pathname,
+      segments,
+      query: url.searchParams,
+      rawBody,
+      json,
+      jsonError,
+      host: request.headers.host ?? 'localhost',
+      requestId,
+    };
+    writeReply(response, route(request, ctx), isApi, requestId);
+  }
+
+  return createServer((request, response) => {
+    handle(request, response).catch(() => {
+      try {
+        if (!response.headersSent) {
+          const body = Buffer.from(JSON.stringify({ message: 'Internal Server Error' }), 'utf8');
+          response.writeHead(500, { 'content-type': 'application/json; charset=utf-8', 'content-length': String(body.length) });
+          response.end(body);
+        } else {
+          response.end();
+        }
+      } catch {
+        // The connection is already gone; nothing more to do.
+      }
+    });
   });
 }
